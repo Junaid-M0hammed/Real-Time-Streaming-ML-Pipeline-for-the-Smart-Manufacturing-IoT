@@ -1,0 +1,179 @@
+version: '3.8'
+
+services:
+  # Zookeeper service (required for Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - secom-network
+
+  # Kafka service
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - secom-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Kafka UI for monitoring (optional)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - secom-network
+
+  # Main application container
+  secom-app:
+    build: .
+    container_name: secom-app
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./output:/app/output
+      - ./checkpoints:/app/checkpoints
+      - ./src:/app/src
+    environment:
+      - KAFKA_HOST=kafka:9092
+      - PYTHONPATH=/app
+    networks:
+      - secom-network
+    command: tail -f /dev/null  # Keep container running
+
+  # Kafka Producer service
+  kafka-producer:
+    build: .
+    container_name: kafka-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    environment:
+      - KAFKA_HOST=kafka:9092
+      - PYTHONPATH=/app
+    networks:
+      - secom-network
+    command: python src/kafka_producer.py --kafka-host kafka:9092 --rate 2.0 --repeat
+    restart: unless-stopped
+
+  # Spark Streaming service
+  spark-streaming:
+    build: .
+    container_name: spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+      - ./output:/app/output
+      - ./checkpoints:/app/checkpoints
+      - ./src:/app/src
+    environment:
+      - KAFKA_HOST=kafka:9092
+      - PYTHONPATH=/app
+      - SPARK_HOME=/opt/spark
+    ports:
+      - "4040:4040"  # Spark UI
+    networks:
+      - secom-network
+    command: >
+      sh -c "
+        pip install pyspark[sql]==3.5.0 &&
+        python src/spark_streaming_job.py --kafka-host kafka:9092
+      "
+    restart: unless-stopped
+
+  # Streamlit Dashboard service
+  streamlit-dashboard:
+    build: .
+    container_name: streamlit-dashboard
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./output:/app/output
+      - ./src:/app/src
+    environment:
+      - KAFKA_HOST=kafka:9092
+      - PYTHONPATH=/app
+    ports:
+      - "8501:8501"
+    networks:
+      - secom-network
+    command: streamlit run src/streamlit_dashboard.py --server.port 8501 --server.address 0.0.0.0
+    restart: unless-stopped
+
+  # Data preparation service (runs once)
+  data-prep:
+    build: .
+    container_name: data-prep
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./src:/app/src
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - secom-network
+    command: >
+      sh -c "
+        echo 'Checking if data is already prepared...' &&
+        if [ ! -f /app/data/secom_preprocessed.csv ]; then
+          echo 'Preprocessing data...' &&
+          python src/preprocess_data.py
+        else
+          echo 'Data already preprocessed.'
+        fi &&
+        if [ ! -f /app/models/model.joblib ]; then
+          echo 'Training model...' &&
+          python src/train_model.py
+        else
+          echo 'Model already trained.'
+        fi &&
+        echo 'Data preparation completed.'
+      "
+
+volumes:
+  kafka-data:
+
+networks:
+  secom-network:
+    driver: bridge 
